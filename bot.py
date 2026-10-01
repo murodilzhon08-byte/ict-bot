@@ -33,10 +33,10 @@ MIN_TREND  = 3            # 5 та ТФ'дан камида нечтаси ўс�
 MUST_UP    = ["1D", "4H"] # шу таймфреймлар албатта ўсишда бўлсин (катта ТФ йўналиши)
 MIN_RR     = 2.0          # мин. риск/фойда нисбати (мўлжал ≥ 2 × риск)
 MAX_RISK   = 2.0          # макс. риск: нархдан стопгача масофа (%)
-MIN_PROFIT = 3.0          # мин. фойда: нархдан мўлжалгача масофа (%)
+MIN_PROFIT = 2.0          # мин. фойда: нархдан мўлжалгача масофа (%)  [олдин 3.0]
 STOP_BUF   = 0.2          # стоп зона остидан қанча пастда (ATR 1H)
 PD_LEN     = 50           # Қиммат/Арзон диапазони (шам)
-PD_MAX     = 45           # шу фоиздан паст — АРЗОН (харид зонаси)
+PD_MAX     = 50           # шу фоиздан паст — АРЗОН (харид зонаси)  [олдин 45]
 TREND_LEN  = 5            # тренд учун swing узунлиги
 OB_SWING   = 3            # OB учун swing узунлиги
 IMP_K      = 2.0          # OB импульс кучи (ATR)
@@ -302,7 +302,7 @@ def analyze(sym):
     levels = sorted(set(bsl_levels(e) + bsl_levels(data["4h"])))
     target = next((t for t in levels
                    if t - last_c >= MIN_RR * risk                       # риск/фойда ≥ 1:2
-                   and (t - last_c) / last_c * 100 >= MIN_PROFIT), None)  # фойда ≥ 3%
+                   and (t - last_c) / last_c * 100 >= MIN_PROFIT), None)  # фойда ≥ 2%
     if target is None:
         return None
 
@@ -343,17 +343,35 @@ def message(r):
 
 
 def send(text):
+    """Telegram'га юборади. Муваффақиятли бўлса True, хато бўлса False қайтаради ва логга ёзади."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("\n" + text + "\n")          # токен йўқ — синов режими, экранга чиқаради
-        return
+        logging.warning("TELEGRAM_TOKEN ёки TELEGRAM_CHAT_ID йўқ — хабар фақат экранга чиқарилди")
+        print("\n" + text + "\n")
+        return False
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=15,
         )
     except Exception as ex:
-        logging.warning(f"Telegram хатоси: {ex}")
+        logging.warning(f"Telegram'га уланиб бўлмади: {type(ex).__name__}")
+        return False
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
+    if r.status_code == 200 and data.get("ok"):
+        return True
+    desc = data.get("description") or r.text[:200]
+    logging.error(f"Telegram хатоси {r.status_code}: {desc}")
+    if r.status_code == 401:
+        logging.error("→ TELEGRAM_TOKEN нотўғри. Secrets'даги токенни текширинг.")
+    elif r.status_code == 400 and "chat not found" in str(desc).lower():
+        logging.error("→ TELEGRAM_CHAT_ID нотўғри ёки ботга /start ёзилмаган.")
+    elif r.status_code == 403:
+        logging.error("→ Бот блокланган ёки сиз ботга /start ёзмагансиз.")
+    return False
 
 
 def load_state():
@@ -378,9 +396,11 @@ def scan_once(sent):
             if r:
                 key = sym + "|" + "|".join(sorted(f"{n}:{fp(b)}" for n, _, b in r["hits"]))
                 if time.time() - sent.get(key, 0) > RESEND_H * 3600:
-                    send(message(r))
-                    sent[key] = time.time()
-                    logging.info(f"Сигнал юборилди: {sym}")
+                    if send(message(r)):
+                        sent[key] = time.time()      # фақат муваффақиятли юборилгани эслаб қолинади
+                        logging.info(f"Сигнал юборилди: {sym}")
+                    else:
+                        logging.warning(f"{sym}: сигнал топилди, лекин Telegram'га юборилмади")
                 else:
                     logging.info(f"{sym}: сигнал аввал юборилган")
             else:
