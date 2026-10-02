@@ -14,12 +14,19 @@ import json
 import time
 import logging
 import requests
+from datetime import datetime, timezone, timedelta
 
 # ═══════════════════════ СОЗЛАМАЛАР ═══════════════════════
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")      # @BotFather берган токен
 CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "")    # сизнинг chat id (@userinfobot)
-SYMBOLS = [s.strip().upper() for s in (os.getenv("SYMBOLS") or
-    "BTCUSDT,ETHUSDT,AVAXUSDT,ATOMUSDT,OPUSDT").split(",") if s.strip()]
+# Кузатиладиган тангалар (28 та). SYMBOLS муҳит ўзгарувчиси берилса — шу рўйхат ўрнига ўша ишлатилади.
+DEFAULT_SYMBOLS = [
+    "WLDUSDT", "ZAMAUSDT", "ASTERUSDT", "JTOUSDT", "AEROUSDT", "ATOMUSDT", "AVAXUSDT",
+    "METUSDT", "RENDERUSDT", "CHZUSDT", "ADAUSDT", "INJUSDT", "XPLUSDT", "CCUSDT",
+    "BCHUSDT", "MONUSDT", "AVNTUSDT", "OPUSDT", "UBUSDT", "LTCUSDT", "SUIUSDT",
+    "QNTUSDT", "TAOUSDT", "DOTUSDT", "POLUSDT", "ZROUSDT", "FOXSYUSDT", "WUSDT",
+]
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()] or DEFAULT_SYMBOLS
 RUN_ONCE   = os.getenv("RUN_ONCE", "") == "1"   # GitHub Actions: бир марта текшириб тугайди
 STATE_FILE = os.getenv("STATE_FILE", "sent.json")  # юборилган сигналлар хотираси
 
@@ -33,10 +40,10 @@ MIN_TREND  = 3            # 5 та ТФ'дан камида нечтаси ўс�
 MUST_UP    = ["1D", "4H"] # шу таймфреймлар албатта ўсишда бўлсин (катта ТФ йўналиши)
 MIN_RR     = 2.0          # мин. риск/фойда нисбати (мўлжал ≥ 2 × риск)
 MAX_RISK   = 2.0          # макс. риск: нархдан стопгача масофа (%)
-MIN_PROFIT = 2.0          # мин. фойда: нархдан мўлжалгача масофа (%)  [олдин 3.0]
+MIN_PROFIT = 3.0          # мин. фойда: нархдан мўлжалгача масофа (%)
 STOP_BUF   = 0.2          # стоп зона остидан қанча пастда (ATR 1H)
 PD_LEN     = 50           # Қиммат/Арзон диапазони (шам)
-PD_MAX     = 50           # шу фоиздан паст — АРЗОН (харид зонаси)  [олдин 45]
+PD_MAX     = 45           # шу фоиздан паст — АРЗОН (харид зонаси)
 TREND_LEN  = 5            # тренд учун swing узунлиги
 OB_SWING   = 3            # OB учун swing узунлиги
 IMP_K      = 2.0          # OB импульс кучи (ATR)
@@ -51,16 +58,21 @@ KLINES     = 500          # ҳар бир ТФ учун олинадиган ш�
 MEXC_URL    = "https://api.mexc.com/api/v3/klines"
 BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"   # захира манба
 BIN_IV      = {"1W": "1w", "1d": "1d", "4h": "4h", "60m": "1h", "15m": "15m"}
-_use_binance = False
+
+MSK = timezone(timedelta(hours=3))   # Москва вақти (UTC+3)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 # ═══════════════════════ МАЪЛУМОТ ═══════════════════════
 def _parse(raw):
+    if not isinstance(raw, list):
+        raise ValueError(f"кутилмаган жавоб: {str(raw)[:120]}")
     now = int(time.time() * 1000)
     rows = [k for k in raw if int(k[6]) <= now]     # фақат ёпилган шамлар
     return {
+        "t": [int(k[0]) for k in rows],             # шам очилиш вақти (мс)
+        "T": [int(k[6]) for k in rows],             # шам ёпилиш вақти (мс)
         "o": [float(k[1]) for k in rows],
         "h": [float(k[2]) for k in rows],
         "l": [float(k[3]) for k in rows],
@@ -68,32 +80,32 @@ def _parse(raw):
     }
 
 
-def klines(symbol, interval, limit=KLINES):
-    """Аввал MEXC'дан олади; MEXC жавоб бермаса — Binance'нинг очиқ маълумотидан."""
-    global _use_binance
-    if not _use_binance:
-        try:
-            r = requests.get(MEXC_URL, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=15)
-            r.raise_for_status()
-            return _parse(r.json())
-        except Exception as ex:
-            logging.warning(f"MEXC жавоб бермади ({ex}) — Binance очиқ маълумотига ўтилди")
-            _use_binance = True
-    r = requests.get(BINANCE_URL, params={"symbol": symbol, "interval": BIN_IV[interval], "limit": limit}, timeout=15)
+def _get(url, symbol, interval, limit=KLINES):
+    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=15)
     r.raise_for_status()
     return _parse(r.json())
 
 
+def fetch_all(symbol):
+    """Барча ТФ'ларни битта манбадан олади: аввал MEXC, бўлмаса Binance.
+    Ҳар бир тангада қайтадан MEXC синаб кўрилади, манбалар аралашиб кетмайди."""
+    try:
+        return {iv: _get(MEXC_URL, symbol, iv) for _, iv in TREND_TFS}
+    except Exception as ex:
+        logging.warning(f"{symbol}: MEXC жавоб бермади ({ex}) — Binance очиқ маълумоти ишлатилади")
+    return {iv: _get(BINANCE_URL, symbol, BIN_IV[iv]) for _, iv in TREND_TFS}
+
+
 def atr(d, n=14):
-    """ATR (RMA), TradingView'даги ta.atr каби."""
+    """ATR (RMA), TradingView'даги ta.atr билан бир хил бошланиш."""
     h, l, c = d["h"], d["l"], d["c"]
     out = [None] * len(c)
-    if len(c) <= n:
+    if len(c) < n:
         return out
     tr = [h[0] - l[0]] + [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, len(c))]
-    a = sum(tr[1:n + 1]) / n
-    out[n] = a
-    for i in range(n + 1, len(c)):
+    a = sum(tr[:n]) / n
+    out[n - 1] = a
+    for i in range(n, len(c)):
         a = (a * (n - 1) + tr[i]) / n
         out[i] = a
     return out
@@ -149,8 +161,9 @@ def pd_pct(d):
 
 
 def fvg_zones(d, a):
-    """Тўлмаган бычий FVG'лар ва бычий IFVG'лар (бузилган медвежий FVG)."""
-    h, l, c = d["h"], d["l"], d["c"]
+    """Тўлмаган бычий FVG'лар ва бычий IFVG'лар (бузилган медвежий FVG).
+    Ҳар бир зона: (тури, юқори, паст, пайдо бўлган вақти)."""
+    h, l, c, T = d["h"], d["l"], d["c"], d["T"]
     n, out = len(c), []
     for i in range(2, n):
         if a[i] is None:
@@ -163,7 +176,7 @@ def fvg_zones(d, a):
                     alive = False
                     break
             if alive:
-                out.append(("FVG", top, bot))
+                out.append(("FVG", top, bot, T[i]))
         # Медвежий FVG → тепасидан ёпилса бычий IFVG
         if h[i] < l[i - 2] and mid_dn(d, i - 1) and l[i - 2] - h[i] > a[i] * MIN_FVG:
             top, bot, conv = l[i - 2], h[i], None
@@ -176,13 +189,13 @@ def fvg_zones(d, a):
             if conv is not None:
                 alive = all(c[k] >= bot for k in range(conv + 1, n))
                 if alive:
-                    out.append(("IFVG", top, bot))
+                    out.append(("IFVG", top, bot, T[conv]))
     return out
 
 
 def ob_zones(d, a):
     """Ҳақиқий бычий OB'лар: BOS (тана), displacement (FVG), импульс, 3 шамда чиқиш, 50% бузилмаган."""
-    o, h, l, c = d["o"], d["h"], d["l"], d["c"]
+    o, h, l, c, T = d["o"], d["h"], d["l"], d["c"], d["T"]
     n, L = len(c), OB_SWING
     lh, hi, out = None, None, []
     for i in range(n):
@@ -200,19 +213,20 @@ def ob_zones(d, a):
             top, bot = h[jj], l[jj]
             strong = max(h[jj:i + 1]) - bot >= IMP_K * a[i]
             eng = any(c[k] > top for k in range(jj + 1, min(jj + 4, i + 1)))
-            disp = any(l[m] > h[m - 2] and mid_up(d, m - 1) for m in range(jj + 2, min(i + 4, n)))
-            if strong and eng and disp:
+            dm = next((m for m in range(jj + 2, min(i + 4, n))
+                       if l[m] > h[m - 2] and mid_up(d, m - 1)), None)
+            if strong and eng and dm is not None:
                 mid = (top + bot) / 2
                 if all(c[k] >= mid for k in range(i + 1, n)):
                     out = [z for z in out if not (z[1] > bot and z[2] < top)]   # устма-уст эскисини олиб ташлаш
-                    out.append(("OB", top, bot))
+                    out.append(("OB", top, bot, T[max(i, dm)]))   # OB тасдиқланган вақт
             lh = None
     return out
 
 
 def ote_zone(d, a):
     """Охирги оёқ кўтарилиш бўлса — OTE (0.62–0.79) харид зонаси."""
-    h, l, c = d["h"], d["l"], d["c"]
+    h, l, c, T = d["h"], d["l"], d["c"], d["T"]
     n, L = len(c), OTE_LEN
     lph = lpl = None
     for j in range(L, n - L):
@@ -222,11 +236,12 @@ def ote_zone(d, a):
             lpl = j
     if lph is None or lpl is None or lph < lpl or a[-1] is None:
         return None
-    hx, lo = max(h[lpl:]), l[lpl]
+    hi_idx = max(range(lpl, n), key=lambda x: h[x])
+    hx, lo = h[hi_idx], l[lpl]
     lg = hx - lo
     if lg < OTE_MIN * a[-1] or c[-1] <= lo:
         return None
-    return ("OTE", hx - 0.62 * lg, hx - 0.79 * lg)
+    return ("OTE", hx - 0.62 * lg, hx - 0.79 * lg, T[max(lph + L, hi_idx)])
 
 
 def ssl_swept(d):
@@ -260,7 +275,7 @@ def fp(x):
 
 
 def analyze(sym):
-    data = {iv: klines(sym, iv) for _, iv in TREND_TFS}
+    data = fetch_all(sym)
     tr = [(nm, trend(data[iv])) for nm, iv in TREND_TFS]
     n_up = sum(1 for _, t in tr if t == 1)
 
@@ -268,6 +283,8 @@ def analyze(sym):
     if len(e["c"]) < PD_LEN + 20:
         return None
     pct = pd_pct(e)
+    pd_hi, pd_lo = max(e["h"][-PD_LEN:]), min(e["l"][-PD_LEN:])
+    disc = (pd_lo, pd_lo + PD_MAX / 100 * (pd_hi - pd_lo))   # арзон зона нархлари: диапазон пасти → PD_MAX чегараси
     tmap = dict(tr)
     if n_up < MIN_TREND or pct > PD_MAX:
         return None
@@ -275,21 +292,29 @@ def analyze(sym):
         return None
 
     last_l, last_c = e["l"][-1], e["c"][-1]
+    t_last = e["t"][-1]          # охирги 1H шам очилган вақт
+    ea_list = atr(e)
     hits = []
     for iv in ZONE_TFS:
         d = data[iv]
-        a = atr(d)
-        for kind, top, bot in ob_zones(d, a) + fvg_zones(d, a):
+        a = ea_list if iv == ENTRY_TF else atr(d)
+        for kind, top, bot, formed in ob_zones(d, a) + fvg_zones(d, a):
+            if formed >= t_last:                     # зона охирги шам билан бирга пайдо бўлган — бу ретест эмас
+                continue
             if last_l <= top and last_c >= bot:      # охирги шам зонага кирган ва остида ёпилмаган
                 hits.append((f"{kind} {TF_NAME[iv]}", top, bot))
-    ote = ote_zone(e, atr(e))
-    if ote and last_l <= ote[1] and last_c >= ote[2]:
+    ote = ote_zone(e, ea_list)
+    if ote and ote[3] < t_last and last_l <= ote[1] and last_c >= ote[2]:
         hits.append(("OTE 1H", ote[1], ote[2]))
     if not hits:
         return None
 
+    # Кириш зонаси: нархга энг яқин (энг юқоридаги) зона — стоп ҳам шу зона остига қўйилади
+    best = max(hits, key=lambda z: z[2])
+    entry_zone = (best[2], min(best[1], last_c))
+
     # Стоп: нархга энг яқин зонанинг остидан бироз пастда
-    ea = atr(e)[-1] or 0.0
+    ea = ea_list[-1] or 0.0
     inval = max(b for _, _, b in hits) - STOP_BUF * ea
     risk = last_c - inval
     if risk <= 0:
@@ -302,16 +327,19 @@ def analyze(sym):
     levels = sorted(set(bsl_levels(e) + bsl_levels(data["4h"])))
     target = next((t for t in levels
                    if t - last_c >= MIN_RR * risk                       # риск/фойда ≥ 1:2
-                   and (t - last_c) / last_c * 100 >= MIN_PROFIT), None)  # фойда ≥ 2%
+                   and (t - last_c) / last_c * 100 >= MIN_PROFIT), None)  # фойда ≥ 3%
     if target is None:
         return None
 
     return {
         "sym": sym,
         "price": last_c,
+        "entry_zone": entry_zone,
+        "time": e["T"][-1] + 1,                     # сигнал шами ёпилган вақт (мс)
         "trend": tr,
         "n_up": n_up,
         "pct": pct,
+        "disc": disc,
         "hits": hits,
         "swept": ssl_swept(e),
         "target": target,
@@ -322,6 +350,11 @@ def analyze(sym):
     }
 
 
+def msk(ms):
+    """Миллисекунддан Москва вақтига: 02.10 14:00."""
+    return datetime.fromtimestamp(ms / 1000, MSK).strftime("%d.%m %H:%M")
+
+
 def message(r):
     arrows = {1: "▲", -1: "▼", 0: "–"}
     tline = " ".join(f"{nm}{arrows[t]}" for nm, t in r["trend"])
@@ -330,48 +363,39 @@ def message(r):
     stars = "⭐" * min(power, 3)
     return (
         f"🟢 <b>ХАРИД СИГНАЛИ — {r['sym']}</b> {stars}\n"
-        f"Нарх: <b>{fp(r['price'])}</b>\n\n"
+        f"Кириш: <b>{fp(r['price'])}</b> (бозор нархи)\n"
+        f"Кириш зонаси: {fp(r['entry_zone'][0])} – {fp(r['entry_zone'][1])}\n"
+        f"🕒 Вақт: {msk(r['time'])} (МСК)\n\n"
         f"Тренд: {tline} ({r['n_up']}/5)\n"
-        f"Зона: АРЗОН {round(r['pct'])}%\n"
+        f"Зона: АРЗОН {fp(r['disc'][0])} – {fp(r['disc'][1])}\n"
         f"Сабаб:\n{zones}\n"
-        f"SSL супурилди: {'✅ ҳа' if r['swept'] else '— йўқ'}\n\n"
-        f"Стоп: {fp(r['inval'])} (риск {r['risk_pct']:.1f}%)\n"
-        f"Мўлжал (BSL): {fp(r['target'])} (+{r['profit_pct']:.1f}%)\n"
-        f"Риск/фойда: 1:{r['rr']:.1f}\n\n"
+        f"SSL олинди: {'✅ ҳа' if r['swept'] else '— йўқ'}\n\n"
+        f"Стоп: {fp(r['inval'])}\n"
+        f"Даромад (BSL): {fp(r['target'])}\n\n"
+        f"🔻 Риск: −{r['risk_pct']:.1f}% (100$ → −{r['risk_pct']:.1f}$)\n"
+        f"🔺 Фойда: +{r['profit_pct']:.1f}% (100$ → +{r['profit_pct']:.1f}$)\n\n"
         f"⚠️ Бу молиявий маслаҳат эмас — графикда тасдиқ кутинг."
     )
 
 
 def send(text):
-    """Telegram'га юборади. Муваффақиятли бўлса True, хато бўлса False қайтаради ва логга ёзади."""
+    """Юборилса True, хато бўлса False қайтаради."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logging.warning("TELEGRAM_TOKEN ёки TELEGRAM_CHAT_ID йўқ — хабар фақат экранга чиқарилди")
-        print("\n" + text + "\n")
-        return False
+        print("\n" + text + "\n")          # токен йўқ — синов режими, экранга чиқаради
+        return True
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=15,
         )
-    except Exception as ex:
-        logging.warning(f"Telegram'га уланиб бўлмади: {type(ex).__name__}")
-        return False
-    try:
-        data = r.json()
-    except Exception:
-        data = {}
-    if r.status_code == 200 and data.get("ok"):
+        if not r.ok:
+            logging.warning(f"Telegram хатоси {r.status_code}: {r.text[:200]}")
+            return False
         return True
-    desc = data.get("description") or r.text[:200]
-    logging.error(f"Telegram хатоси {r.status_code}: {desc}")
-    if r.status_code == 401:
-        logging.error("→ TELEGRAM_TOKEN нотўғри. Secrets'даги токенни текширинг.")
-    elif r.status_code == 400 and "chat not found" in str(desc).lower():
-        logging.error("→ TELEGRAM_CHAT_ID нотўғри ёки ботга /start ёзилмаган.")
-    elif r.status_code == 403:
-        logging.error("→ Бот блокланган ёки сиз ботга /start ёзмагансиз.")
-    return False
+    except Exception as ex:
+        logging.warning(f"Telegram хатоси: {ex}")
+        return False
 
 
 def load_state():
@@ -389,18 +413,16 @@ def save_state(sent):
         json.dump(keep, f, ensure_ascii=False, indent=1)
 
 
-def scan_once(sent):
-    for sym in SYMBOLS:
+def scan_once(sent, symbols):
+    for sym in symbols:
         try:
             r = analyze(sym)
             if r:
                 key = sym + "|" + "|".join(sorted(f"{n}:{fp(b)}" for n, _, b in r["hits"]))
                 if time.time() - sent.get(key, 0) > RESEND_H * 3600:
-                    if send(message(r)):
-                        sent[key] = time.time()      # фақат муваффақиятли юборилгани эслаб қолинади
+                    if send(message(r)):             # фақат муваффақиятли юборилса эслаб қолади
+                        sent[key] = time.time()
                         logging.info(f"Сигнал юборилди: {sym}")
-                    else:
-                        logging.warning(f"{sym}: сигнал топилди, лекин Telegram'га юборилмади")
                 else:
                     logging.info(f"{sym}: сигнал аввал юборилган")
             else:
@@ -412,13 +434,14 @@ def scan_once(sent):
 
 def main():
     sent = load_state()
+    symbols = SYMBOLS
     if RUN_ONCE:                      # GitHub Actions режими
-        scan_once(sent)
+        scan_once(sent, symbols)
         save_state(sent)
         return
-    send("🤖 <b>Сигнал бот ишга тушди</b>\nКузатилмоқда: " + ", ".join(SYMBOLS))
+    send(f"🤖 <b>Сигнал бот ишга тушди</b>\nКузатилмоқда ({len(symbols)} та): " + ", ".join(symbols))
     while True:                       # доимий режим (компьютер/VPS)
-        scan_once(sent)
+        scan_once(sent, symbols)
         save_state(sent)
         time.sleep(SCAN_EVERY)
 
